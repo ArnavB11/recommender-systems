@@ -1,134 +1,130 @@
-import os
 import time
 import numpy as np
 import torch
-from dopm import DOPMRecommender
+
 from weighted_roulette import generate_weighted_roulette_lists
 from psnr_filter import filter_by_psnr_sweetspot
 from data_loader import MovieLensData
-from ncf_inference import load_trained_model
+from ncf_inference import get_pure_signal, load_trained_model
+
+N_LIST_SIZE = 10
+NUM_VARIATIONS = 1000
+ROULETTE_POOL_SIZE = 50
+SAMPLE_USERS = [0, 99, 499]
+
+
+def generate_full_r_hat(model, n_users, n_items):
+    all_users = torch.arange(n_users).repeat_interleave(n_items)
+    all_items = torch.arange(n_items).repeat(n_users)
+
+    with torch.no_grad():
+        all_scores = model(all_users, all_items)
+
+    return all_scores.detach().cpu().numpy().reshape(n_users, n_items)
+
+
+def get_movie_titles(data, item_indices):
+    return [
+        data.items_df.loc[data.idx2item[item_idx], "title"]
+        for item_idx in item_indices
+    ]
+
 
 def run_pipeline():
-    print("--- Initializing MovieLens Data ---")
+    print("--- Phase 1: Loading Data and Generating NCF Scores ---")
     data = MovieLensData()
-    
-    # 1. Map NCF dataframe to DOPM format
-    print("\n--- Mapping Data for DOPM ---")
-    # DOPM needs: movie_genres = {item_idx: [genre1, genre2...]}
-    movie_genres = {}
-    for item_idx, item_id in data.idx2item.items():
-        genres_str = data.items_df.loc[item_id, "genres"]
-        movie_genres[item_idx] = genres_str.split("|")
-        
-    # user_history is already provided perfectly by data.user_history
-    user_history = data.user_history
 
-    # 2. Initialize and Fit DOPM
-    print("\n--- Initializing DOPM Recommender ---")
-    dopm_system = DOPMRecommender(epsilon=0.01)
-    
-    start_time = time.perf_counter()
-    dopm_system.fit(user_history, movie_genres)
-    end_time = time.perf_counter()
-    
-    print(f"DOPM Precomputation Finished in {(end_time - start_time)*1000:.2f} ms")
-    
-    U = data.n_users
-    M = data.n_items
-    
-    # 3. Predict authentic NCF R_hat_matrix
-    print("\n--- Running Authentic PyTorch NCF Inference ---")
     model = load_trained_model(data)
-    
-    # Generate all (User, Item) pairs to create the full matrix
-    all_users = torch.arange(U).repeat_interleave(M)
-    all_items = torch.arange(M).repeat(U)
-    
+
     start_time = time.perf_counter()
-    with torch.no_grad():
-        # Compute the authentic neural network predictions!
-        all_scores = model(all_users, all_items)
-        
-    R_hat = all_scores.numpy().reshape(U, M)
+    R_hat = generate_full_r_hat(model, data.n_users, data.n_items)
     end_time = time.perf_counter()
-    print(f"Generated real predictions for {U * M:,} pairs in {(end_time - start_time):.2f} seconds")
-    
-    # 4. Generate Weighted Roulette Lists
-    print("\n--- Generating Weighted Roulette Variants ---")
-    
-    # We first extract the DOPM scores across all (U, M) pairs
-    dopm_scores = dopm_system.calculate_dopm_batch(R_hat)
-    
-    # Generate variations
-    N_list_size = 10
-    num_variations = 1000
-    pool_size = 50
-    
+
+    print(f"Generated R_hat with shape {R_hat.shape} in {(end_time - start_time):.2f} seconds")
+
+    print("\n--- Phase 2: Building Per-User Initial Chromosomes ---")
+    P0 = {}
+    sample_results = {}
+
     start_time = time.perf_counter()
-    roulette_lists = generate_weighted_roulette_lists(
-        dopm_scores=dopm_scores,
-        user_watch_matrix=dopm_system.W,
-        users=dopm_system.users,
-        movies=dopm_system.movies,
-        N=N_list_size,
-        variations=num_variations,
-        pool_size=pool_size
-    )
-    end_time = time.perf_counter()
-    print(f"Generated {num_variations} variants per user in {(end_time - start_time):.4f} seconds")
-    
-    # 5. PSNR Sweet-Spot Filtering
-    print("\n--- Filtering lists dynamically using PSNR ---")
-    
-    # Inspect a few random users by their actual int indices (0-indexed now)
-    sample_users = [0, 99, 499] 
-    
-    for u_idx in sample_users:
-        if u_idx not in roulette_lists:
+    for u_idx in range(data.n_users):
+        pure_signal = get_pure_signal(
+            R_hat[u_idx],
+            data.user_history.get(u_idx, set()),
+        )
+
+        candidate_items = pure_signal["item_indices"]
+        candidate_scores = np.asarray(pure_signal["scores"], dtype=np.float64)
+
+        if len(candidate_items) == 0:
+            P0[u_idx] = []
             continue
-            
-        print(f"\n{'='*60}\nEvaluating User Index {u_idx}\n{'='*60}")
-        
-        user_predicted_ratings = R_hat[u_idx, :]
-        
+
         movie_scores_dict = {
-            m_idx: user_predicted_ratings[m_idx] 
-            for m_idx in dopm_system.movies
+            item_idx: float(score)
+            for item_idx, score in zip(candidate_items, candidate_scores)
         }
-        
-        # Unseen movies mask
-        unseen_movies_mask = (dopm_system.W[u_idx, :] == 0)
-        unseen_ratings = np.where(unseen_movies_mask, user_predicted_ratings, -1.0)
-        
-        top_N_indices = np.argpartition(unseen_ratings, -N_list_size)[-N_list_size:]
-        top_N_indices = top_N_indices[np.argsort(-unseen_ratings[top_N_indices])]
-        
-        original_ncf_list = [dopm_system.movies[idx] for idx in top_N_indices]
-        
-        print(f"Original purely-accurate NCF list (Top {N_list_size}):")
-        # Map item indices to their actual titles
-        titles_ncf = [data.items_df.loc[data.idx2item[m], "title"] for m in original_ncf_list]
-        print(titles_ncf)
-        
+
+        roulette_lists = generate_weighted_roulette_lists(
+            pure_signal_scores=candidate_scores.reshape(1, -1),
+            user_watch_matrix=np.zeros((1, len(candidate_items)), dtype=np.int8),
+            users=[u_idx],
+            movies=candidate_items,
+            N=N_LIST_SIZE,
+            variations=NUM_VARIATIONS,
+            pool_size=ROULETTE_POOL_SIZE,
+        )
+
+        original_ncf_list = candidate_items[:N_LIST_SIZE]
         accepted_variants, low, high = filter_by_psnr_sweetspot(
             original_list=original_ncf_list,
             variant_lists=roulette_lists[u_idx],
             movie_scores_dict=movie_scores_dict,
             lower_percentile=25,
-            upper_percentile=75
+            upper_percentile=75,
+            max_val=1.0,
         )
-        
-        print(f"\nDynamically Calculated Sweet Spot:")
-        print(f"  Lower Bound (25th Percentile): {low:.2f}")
-        print(f"  Upper Bound (75th Percentile): {high:.2f}")
-        
-        print(f"\n{len(accepted_variants)} lists passed the sweet-spot test!")
-        # Print first 2 accepted variants to keep terminal clean
-        for idx, item in enumerate(accepted_variants[:2]):
-            print(f"\nAccepted Variant {idx+1} [PSNR {item['psnr']:.2f}]:")
-            variant_titles = [data.items_df.loc[data.idx2item[m], "title"] for m in item['list']]
-            print(variant_titles)
-        print(f"... and {len(accepted_variants) - 2} more variants.")
+
+        P0[u_idx] = [variant["list"] for variant in accepted_variants]
+
+        if u_idx in SAMPLE_USERS:
+            sample_results[u_idx] = {
+                "candidate_count": len(candidate_items),
+                "original_ncf_list": original_ncf_list,
+                "accepted_variants": accepted_variants,
+                "lower_threshold": low,
+                "upper_threshold": high,
+            }
+
+    end_time = time.perf_counter()
+    print(f"Built P0 for {len(P0):,} users in {(end_time - start_time):.2f} seconds")
+
+    for u_idx in SAMPLE_USERS:
+        if u_idx not in sample_results:
+            continue
+
+        result = sample_results[u_idx]
+        accepted_variants = result["accepted_variants"]
+
+        print(f"\n{'=' * 60}")
+        print(f"User Index {u_idx}")
+        print(f"{'=' * 60}")
+        print(f"S* candidate count: {result['candidate_count']}")
+        print(f"P0 chromosome count: {len(P0[u_idx])}")
+        print(
+            "PSNR sweet spot: "
+            f"{result['lower_threshold']:.2f} to {result['upper_threshold']:.2f}"
+        )
+
+        print(f"\nOriginal NCF Top {N_LIST_SIZE}:")
+        print(get_movie_titles(data, result["original_ncf_list"]))
+
+        for idx, variant in enumerate(accepted_variants[:2], start=1):
+            print(f"\nP0 Chromosome {idx} [PSNR {variant['psnr']:.2f}]:")
+            print(get_movie_titles(data, variant["list"]))
+
+    return P0
+
 
 if __name__ == "__main__":
     run_pipeline()
