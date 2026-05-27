@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import torch
 from ncf_model import NeuMF
 
@@ -13,28 +14,33 @@ def load_trained_model(data):
     model.eval()
     return model
 
-def get_pure_signal(model, data, user_idx):
-    unseen = list(set(range(data.n_items)) - data.user_history.get(user_idx, set()))
-    unseen_tensor = torch.LongTensor(unseen)
-    user_tensor = torch.LongTensor([user_idx] * len(unseen))
+def get_pure_signal(R_hat_row, user_history):
+    scores = np.asarray(R_hat_row)
+    if scores.ndim != 1:
+        raise ValueError("R_hat_row must be a 1D array of item scores.")
 
-    scores = []
-    with torch.no_grad():
-        for start in range(0, len(unseen), 512):
-            end = start + 512
-            batch_scores = model(user_tensor[start:end],
-                                 unseen_tensor[start:end])
-            scores.append(batch_scores)
+    unseen_mask = np.ones(scores.shape[0], dtype=bool)
+    if user_history:
+        unseen_mask[list(user_history)] = False
 
-    scores = torch.cat(scores).numpy()
+    unseen_indices = np.flatnonzero(unseen_mask)
+    if len(unseen_indices) == 0:
+        return {
+            "item_indices": [],
+            "scores": [],
+        }
 
-    order = scores.argsort()[::-1]
-    top_indices = order[:CANDIDATE_POOL]
+    unseen_scores = scores[unseen_indices]
+    top_count = min(CANDIDATE_POOL, len(unseen_indices))
+    top_positions = np.argpartition(unseen_scores, -top_count)[-top_count:]
+    top_positions = top_positions[
+        np.argsort(-unseen_scores[top_positions], kind="mergesort")
+    ]
+    top_item_indices = unseen_indices[top_positions]
 
     return {
-        "user_idx": user_idx,
-        "item_indices": [int(unseen[i]) for i in top_indices],
-        "scores": [float(scores[i]) for i in top_indices],
+        "item_indices": [int(item_idx) for item_idx in top_item_indices],
+        "scores": [float(score) for score in unseen_scores[top_positions]],
     }
 
 def display_recommendations(pure_signal, data, top_n=TOP_K):
@@ -60,10 +66,15 @@ if __name__ == "__main__":
     model = load_trained_model(data)
 
     user_idx = 0
-    pure_signal = get_pure_signal(model, data, user_idx)
+    all_items = torch.arange(data.n_items)
+    user_tensor = torch.full((data.n_items,), user_idx, dtype=torch.long)
+    with torch.no_grad():
+        R_hat_row = model(user_tensor, all_items).numpy()
+
+    pure_signal = get_pure_signal(R_hat_row, data.user_history.get(user_idx, set()))
     display_recommendations(pure_signal, data)
 
-    print(f"\nTotal items scored : {len(set(range(data.n_items)) - data.user_history.get(user_idx, set()))}")
+    print(f"\nTotal unseen items : {len(set(range(data.n_items)) - data.user_history.get(user_idx, set()))}")
     print(f"Pool size          : {len(pure_signal['item_indices'])}")
     print(f"Score min          : {min(pure_signal['scores']):.4f}")
     print(f"Score max          : {max(pure_signal['scores']):.4f}")

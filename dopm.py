@@ -174,24 +174,3 @@ if __name__ == "__main__":
     R_hat[u1_idx, m2_idx] = 4.5
     R_hat[u1_idx, m3_idx] = 4.0
     
-    print("\n--- Generating Weighted Roulette Lists for PSNR Comparison ---")
-    from weighted_roulette import generate_weighted_roulette_lists
-    
-    # 1. Get final DOPM scores using the batch calculation
-    dopm_scores = dopm_system.calculate_dopm_batch(R_hat)
-    
-    # 2. Call the standalone roulette function
-    lists = generate_weighted_roulette_lists(
-        dopm_scores=dopm_scores,
-        user_watch_matrix=dopm_system.W,
-        users=dopm_system.users,
-        movies=dopm_system.movies,
-        N=2, 
-        variations=3, 
-        pool_size=3
-    )
-    
-    for u, variations in lists.items():
-        print(f"\nUser {u} variations:")
-        for i, lst in enumerate(variations):
-            print(f"  List {i+1}: {lst}")
