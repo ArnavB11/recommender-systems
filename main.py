@@ -7,6 +7,12 @@ from psnr_filter import filter_by_psnr_sweetspot
 from data_loader import MovieLensData
 from ncf_inference import get_pure_signal, load_trained_model
 
+# Import our new multi-objective serendipity optimization components
+from dataset_linker import DatasetLinker
+from serendipity import SerendipityModel
+from genetic_algorithm import run_nsga2_optimization
+from dopm import DOPMRecommender
+
 N_LIST_SIZE = 10
 NUM_VARIATIONS = 1000
 ROULETTE_POOL_SIZE = 50
@@ -42,7 +48,20 @@ def run_pipeline():
 
     print(f"Generated R_hat with shape {R_hat.shape} in {(end_time - start_time):.2f} seconds")
 
-    print("\n--- Phase 2: Building Per-User Initial Chromosomes ---")
+    print("\n--- Phase 2: Initializing DOPM & BERT Serendipity Models ---")
+    # Initialize the Stakeholder DOPM Recommender and Fit
+    dopm_system = DOPMRecommender()
+    movie_genres = {
+        item_idx: data.items_df.loc[data.idx2item[item_idx], "genres"].split("|")
+        for item_idx in range(data.n_items)
+    }
+    dopm_system.fit(data.user_history, movie_genres)
+    
+    # Initialize Dataset Linker and BERT Serendipity Model
+    linker = DatasetLinker()
+    serendipity_system = SerendipityModel(data=data, linker=linker)
+
+    print("\n--- Phase 3: Building Per-User Initial Chromosomes (P0) ---")
     P0 = {}
     sample_results = {}
 
@@ -99,30 +118,84 @@ def run_pipeline():
     end_time = time.perf_counter()
     print(f"Built P0 for {len(P0):,} users in {(end_time - start_time):.2f} seconds")
 
+    print("\n--- Phase 4: Running Pymoo Multi-Objective NSGA-II Optimization ---")
+    
     for u_idx in SAMPLE_USERS:
         if u_idx not in sample_results:
             continue
-
+            
+        print(f"\nRunning NSGA-II optimization for User {u_idx}...")
+        
         result = sample_results[u_idx]
-        accepted_variants = result["accepted_variants"]
-
-        print(f"\n{'=' * 60}")
-        print(f"User Index {u_idx}")
-        print(f"{'=' * 60}")
-        print(f"S* candidate count: {result['candidate_count']}")
-        print(f"P0 chromosome count: {len(P0[u_idx])}")
-        print(
-            "PSNR sweet spot: "
-            f"{result['lower_threshold']:.2f} to {result['upper_threshold']:.2f}"
+        pure_signal = get_pure_signal(R_hat[u_idx], data.user_history.get(u_idx, set()))
+        candidate_pool = pure_signal["item_indices"]
+        
+        initial_variants = P0[u_idx]
+        if not initial_variants:
+            print(f"Skipping User {u_idx} due to empty P0 chromosome population.")
+            continue
+            
+        ga_start = time.perf_counter()
+        best_movie_list, pareto_metrics = run_nsga2_optimization(
+            user_idx=u_idx,
+            candidate_pool=candidate_pool,
+            ncf_scores=R_hat[u_idx],
+            dopm_recommender=dopm_system,
+            serendipity_model=serendipity_system,
+            user_history=list(data.user_history.get(u_idx, set())),
+            initial_population_variants=initial_variants,
+            N=N_LIST_SIZE,
+            pop_size=50,
+            n_generations=40
         )
-
-        print(f"\nOriginal NCF Top {N_LIST_SIZE}:")
+        ga_elapsed = time.perf_counter() - ga_start
+        print(f"User {u_idx} NSGA-II optimization completed in {ga_elapsed:.2f} seconds.")
+        
+        # Calculate metric scores for original vs optimized lists
+        user_pref_vec = serendipity_system.compute_user_preference_vector(data.user_history.get(u_idx, set()))
+        user_hist_list = list(data.user_history.get(u_idx, set()))
+        
+        def evaluate_list(movie_list):
+            acc = np.mean([R_hat[u_idx][m] for m in movie_list])
+            nov = np.mean([dopm_system.calculate_novelty(u_idx, m) for m in movie_list])
+            ser = np.mean([serendipity_system.calculate_serendipity(user_hist_list, user_pref_vec, m) for m in movie_list])
+            return acc, nov, ser
+            
+        orig_acc, orig_nov, orig_ser = evaluate_list(result["original_ncf_list"])
+        opt_acc, opt_nov, opt_ser = evaluate_list(best_movie_list)
+        
+        # Calculate Multi-Objective Harmonic Score (MOHS)
+        # MOHS is a 3-variable harmonic mean, punishing poor performance in any single metric.
+        def calculate_mohs(acc, nov, ser):
+            acc = max(acc, 1e-6)
+            nov = max(nov, 1e-6)
+            ser = max(ser, 1e-6)
+            return 3.0 / (1.0 / acc + 1.0 / nov + 1.0 / ser)
+            
+        orig_mohs = calculate_mohs(orig_acc, orig_nov, orig_ser)
+        opt_mohs = calculate_mohs(opt_acc, opt_nov, opt_ser)
+        mohs_improvement = ((opt_mohs - orig_mohs) / orig_mohs) * 100.0
+        
+        print(f"\n{'=' * 75}")
+        print(f"Comparison Summary for User {u_idx}")
+        print(f"{'=' * 75}")
+        print(f"{'Objective Metric':<20} | {'Original NCF List':<22} | {'NSGA-II Optimized List':<22}")
+        print(f"{'-' * 75}")
+        print(f"{'NCF Rating Accuracy':<20} | {orig_acc:<22.4f} | {opt_acc:<22.4f}")
+        print(f"{'DOPM Genre Diversity':<20} | {orig_nov:<22.4f} | {opt_nov:<22.4f}")
+        print(f"{'BERT Serendipity':<20} | {orig_ser:<22.4f} | {opt_ser:<22.4f}")
+        print(f"{'-' * 75}")
+        print(f"{'MOHS Quality Score':<20} | {orig_mohs:<22.4f} | {opt_mohs:<22.4f}")
+        print(f"{'MOHS Net Improvement':<20} | {'-':<22} | {f'+{mohs_improvement:.2f}%':<22}")
+        print(f"{'-' * 75}")
+        
+        print("\nOriginal Top NCF Recommendation Titles:")
         print(get_movie_titles(data, result["original_ncf_list"]))
-
-        for idx, variant in enumerate(accepted_variants[:2], start=1):
-            print(f"\nP0 Chromosome {idx} [PSNR {variant['psnr']:.2f}]:")
-            print(get_movie_titles(data, variant["list"]))
-
+        
+        print("\nNSGA-II Multi-Objective Optimized Recommendation Titles:")
+        print(get_movie_titles(data, best_movie_list))
+        print(f"{'=' * 75}\n")
+        
     return P0
 
 
