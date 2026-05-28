@@ -12,6 +12,7 @@ from dataset_linker import DatasetLinker
 from serendipity import SerendipityModel
 from genetic_algorithm import run_nsga2_optimization
 from dopm import DOPMRecommender
+from fairness import FairnessObjective
 
 N_LIST_SIZE = 10
 NUM_VARIATIONS = 1000
@@ -48,7 +49,7 @@ def run_pipeline():
 
     print(f"Generated R_hat with shape {R_hat.shape} in {(end_time - start_time):.2f} seconds")
 
-    print("\n--- Phase 2: Initializing DOPM & BERT Serendipity Models ---")
+    print("\n--- Phase 2: Initializing DOPM, BERT Serendipity & Fairness Models ---")
     # Initialize the Stakeholder DOPM Recommender and Fit
     dopm_system = DOPMRecommender()
     movie_genres = {
@@ -60,6 +61,9 @@ def run_pipeline():
     # Initialize Dataset Linker and BERT Serendipity Model
     linker = DatasetLinker()
     serendipity_system = SerendipityModel(data=data, linker=linker)
+    
+    fairness_model = FairnessObjective(data)
+    fairness_model.fit()
 
     print("\n--- Phase 3: Building Per-User Initial Chromosomes (P0) ---")
     P0 = {}
@@ -142,6 +146,7 @@ def run_pipeline():
             ncf_scores=R_hat[u_idx],
             dopm_recommender=dopm_system,
             serendipity_model=serendipity_system,
+            fairness_model=fairness_model,
             user_history=list(data.user_history.get(u_idx, set())),
             initial_population_variants=initial_variants,
             N=N_LIST_SIZE,
@@ -156,24 +161,32 @@ def run_pipeline():
         user_hist_list = list(data.user_history.get(u_idx, set()))
         
         def evaluate_list(movie_list):
-            acc = np.mean([R_hat[u_idx][m] for m in movie_list])
-            nov = np.mean([dopm_system.calculate_novelty(u_idx, m) for m in movie_list])
-            ser = np.mean([serendipity_system.calculate_serendipity(user_hist_list, user_pref_vec, m) for m in movie_list])
-            return acc, nov, ser
+            dopm_scores = [
+                dopm_system.calculate_dopm(u_idx, m, R_hat[u_idx][m])
+                for m in movie_list
+            ]
+            ser_scores = [
+                serendipity_system.calculate_serendipity(user_hist_list, user_pref_vec, m)
+                for m in movie_list
+            ]
+            dopm_dict = {m: score for m, score in zip(movie_list, dopm_scores)}
+            ser_dict = {m: score for m, score in zip(movie_list, ser_scores)}
+            fair = fairness_model.compute_fairness(movie_list, dopm_dict, ser_dict)
+            return np.mean(dopm_scores), np.mean(ser_scores), fair
             
-        orig_acc, orig_nov, orig_ser = evaluate_list(result["original_ncf_list"])
-        opt_acc, opt_nov, opt_ser = evaluate_list(best_movie_list)
+        orig_dopm, orig_ser, orig_fair = evaluate_list(result["original_ncf_list"])
+        opt_dopm, opt_ser, opt_fair = evaluate_list(best_movie_list)
         
         # Calculate Multi-Objective Harmonic Score (MOHS)
         # MOHS is a 3-variable harmonic mean, punishing poor performance in any single metric.
-        def calculate_mohs(acc, nov, ser):
-            acc = max(acc, 1e-6)
-            nov = max(nov, 1e-6)
+        def calculate_mohs(dopm, ser, fair):
+            dopm = max(dopm, 1e-6)
             ser = max(ser, 1e-6)
-            return 3.0 / (1.0 / acc + 1.0 / nov + 1.0 / ser)
+            fair = max(fair, 1e-6)
+            return 3.0 / (1.0 / dopm + 1.0 / ser + 1.0 / fair)
             
-        orig_mohs = calculate_mohs(orig_acc, orig_nov, orig_ser)
-        opt_mohs = calculate_mohs(opt_acc, opt_nov, opt_ser)
+        orig_mohs = calculate_mohs(orig_dopm, orig_ser, orig_fair)
+        opt_mohs = calculate_mohs(opt_dopm, opt_ser, opt_fair)
         mohs_improvement = ((opt_mohs - orig_mohs) / orig_mohs) * 100.0
         
         print(f"\n{'=' * 75}")
@@ -181,9 +194,9 @@ def run_pipeline():
         print(f"{'=' * 75}")
         print(f"{'Objective Metric':<20} | {'Original NCF List':<22} | {'NSGA-II Optimized List':<22}")
         print(f"{'-' * 75}")
-        print(f"{'NCF Rating Accuracy':<20} | {orig_acc:<22.4f} | {opt_acc:<22.4f}")
-        print(f"{'DOPM Genre Diversity':<20} | {orig_nov:<22.4f} | {opt_nov:<22.4f}")
+        print(f"{'DOPM':<20} | {orig_dopm:<22.4f} | {opt_dopm:<22.4f}")
         print(f"{'BERT Serendipity':<20} | {orig_ser:<22.4f} | {opt_ser:<22.4f}")
+        print(f"{'Fairness':<20} | {orig_fair:<22.4f} | {opt_fair:<22.4f}")
         print(f"{'-' * 75}")
         print(f"{'MOHS Quality Score':<20} | {orig_mohs:<22.4f} | {opt_mohs:<22.4f}")
         print(f"{'MOHS Net Improvement':<20} | {'-':<22} | {f'+{mohs_improvement:.2f}%':<22}")

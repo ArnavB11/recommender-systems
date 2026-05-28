@@ -34,6 +34,10 @@ if __name__ == "__main__":
     ml_url = "https://files.grouplens.org/datasets/movielens/ml-100k.zip"
     download_and_extract(ml_url, data_dir)
     
+    # MovieLens Latest Small (needed for IMDb ID linking)
+    ml_small_url = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
+    download_and_extract(ml_small_url, data_dir)
+    
     # IMDB dataset
     imdb_url = "https://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz"
     download_and_extract(imdb_url, data_dir)
