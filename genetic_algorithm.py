@@ -1,44 +1,78 @@
 import numpy as np
 from pymoo.core.problem import Problem
-from pymoo.core.repair import Repair
+from pymoo.core.crossover import Crossover
+from pymoo.core.mutation import Mutation
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.optimize import minimize
-from pymoo.operators.crossover.sbx import SBX
-from pymoo.operators.mutation.pm import PM
 from pymoo.core.population import Population
 
-class DuplicateRepair(Repair):
+class OrderCrossover(Crossover):
     """
-    A custom repair operator for pymoo to ensure that all chromosomes 
-    (which represent recommendation lists of item indices) contain 
-    completely unique movies with zero duplicates.
+    Order Crossover (OX) for permutation chromosomes.
     """
-    def __init__(self, pool_size):
-        super().__init__()
-        self.pool_size = pool_size
+    def __init__(self, prob=0.9):
+        super().__init__(n_parents=2, n_offsprings=2, prob=prob)
 
-    def _do(self, problem, X, **kwargs):
-        # X is the matrix of chromosomes with shape (pop_size, n_var)
-        for i in range(len(X)):
-            chromosome = X[i].astype(int)
-            unique_vals, indices = np.unique(chromosome, return_index=True)
-            
-            # If duplicates exist, replace them with unique elements from the pool
-            if len(unique_vals) < len(chromosome):
-                available_pool = set(range(self.pool_size)) - set(unique_vals)
-                # Sort available pool for reproducibility
-                available_list = sorted(list(available_pool))
-                
-                # Identify which positions in the chromosome are duplicates
-                duplicate_positions = set(range(len(chromosome))) - set(indices)
-                for pos in duplicate_positions:
-                    if available_list:
-                        new_val = np.random.choice(available_list)
-                        available_list.remove(new_val)
-                        chromosome[pos] = new_val
-                
-                X[i] = chromosome
-        return X
+    @staticmethod
+    def _make_child(parent_a, parent_b, random_state):
+        n_var = len(parent_a)
+        if n_var < 2:
+            return parent_a.copy()
+
+        child = np.full(n_var, -1, dtype=parent_a.dtype)
+
+        start, end = sorted(random_state.choice(n_var, size=2, replace=False))
+        child[start:end + 1] = parent_a[start:end + 1]
+
+        child_values = set(child[start:end + 1])
+        fill_positions = [idx for idx in range(n_var) if child[idx] == -1]
+        fill_values = [gene for gene in parent_b if gene not in child_values]
+
+        for idx, gene in zip(fill_positions, fill_values):
+            child[idx] = gene
+
+        return child
+
+    def _do(self, problem, X, *args, random_state=None, **kwargs):
+        _, n_matings, n_var = X.shape
+        Y = np.empty((self.n_offsprings, n_matings, n_var), dtype=X.dtype)
+
+        for k in range(n_matings):
+            parent_a = X[0, k].astype(int)
+            parent_b = X[1, k].astype(int)
+
+            Y[0, k] = self._make_child(parent_a, parent_b, random_state)
+            Y[1, k] = self._make_child(parent_b, parent_a, random_state)
+
+        return Y
+
+
+class SwapMutation(Mutation):
+    """
+    Swap mutation for permutation chromosomes.
+    """
+    def __init__(self, prob):
+        super().__init__(prob=1.0)
+        self.prob_gene = prob
+
+    def _do(self, problem, X, *args, random_state=None, **kwargs):
+        Y = X.copy().astype(int)
+        n_individuals, n_var = Y.shape
+
+        if n_var < 2:
+            return Y
+
+        for i in range(n_individuals):
+            for j in range(n_var):
+                if random_state.random() < self.prob_gene:
+                    swap_idx = random_state.integers(0, n_var)
+                    while swap_idx == j:
+                        swap_idx = random_state.integers(0, n_var)
+
+                    Y[i, j], Y[i, swap_idx] = Y[i, swap_idx], Y[i, j]
+
+        return Y
+
 
 class RecommendationListProblem(Problem):
     """
@@ -48,16 +82,17 @@ class RecommendationListProblem(Problem):
     - An integer vector X of size N, where each element is an index in the candidate movie pool [0, K-1].
     
     Conflicting Objectives to Minimize (using negative values for maximization):
-    1. f1 = -Accuracy (Mean NCF sigmoid prediction score)
-    2. f2 = -DOPM Novelty (Mean genre-based novelty score)
-    3. f3 = -Serendipity (Mean review-based unexpectedness/relevance score)
+    1. f1 = -DOPM (Mean full DOPM score)
+    2. f2 = -Serendipity (Mean full serendipity score)
+    3. f3 = -Fairness (Mean HDB * exposure penalty * quality score)
     """
-    def __init__(self, user_idx, candidate_pool, ncf_scores, dopm_recommender, serendipity_model, user_history, N=10):
+    def __init__(self, user_idx, candidate_pool, ncf_scores, dopm_recommender, serendipity_model, fairness_model, user_history, N=10):
         self.user_idx = user_idx
         self.candidate_pool = candidate_pool  # List of actual item_idx
         self.ncf_scores = ncf_scores          # NCF scores for this user across all items
         self.dopm = dopm_recommender
         self.serendipity = serendipity_model
+        self.fairness_model = fairness_model
         self.user_history = user_history
         self.N = N
         
@@ -85,23 +120,27 @@ class RecommendationListProblem(Problem):
             movie_pool_indices = X[p].astype(int)
             actual_movies = [self.candidate_pool[idx] for idx in movie_pool_indices]
             
-            # 1. Accuracy: average NCF score
-            acc_scores = [self.ncf_scores[m] for m in actual_movies]
-            f1[p] = -np.mean(acc_scores)
+            # 1. DOPM: average full DOPM score
+            dopm_scores = [
+                self.dopm.calculate_dopm(self.user_idx, m, self.ncf_scores[m])
+                for m in actual_movies
+            ]
+            f1[p] = -np.mean(dopm_scores)
             
-            # 2. Diversity: average DOPM novelty
-            nov_scores = [self.dopm.calculate_novelty(self.user_idx, m) for m in actual_movies]
-            f2[p] = -np.mean(nov_scores)
-            
-            # 3. Serendipity: average review-based serendipity
+            # 2. Serendipity: average full serendipity score
             ser_scores = [self.serendipity.calculate_serendipity(self.user_history, self.user_pref_vector, m) for m in actual_movies]
-            f3[p] = -np.mean(ser_scores)
+            f2[p] = -np.mean(ser_scores)
+            
+            # 3. Fairness: average HDB, exposure penalty, and quality balance
+            dopm_dict = {m: score for m, score in zip(actual_movies, dopm_scores)}
+            ser_dict = {m: score for m, score in zip(actual_movies, ser_scores)}
+            f3[p] = -self.fairness_model.compute_fairness(actual_movies, dopm_dict, ser_dict)
             
         # Pymoo minimizes all objectives
         out["F"] = np.column_stack([f1, f2, f3])
 
 def run_nsga2_optimization(user_idx, candidate_pool, ncf_scores, dopm_recommender, 
-                           serendipity_model, user_history, initial_population_variants, 
+                           serendipity_model, fairness_model, user_history, initial_population_variants, 
                            N=10, pop_size=50, n_generations=40):
     """
     Runs NSGA-II multi-objective optimization to find the Pareto optimal 
@@ -118,12 +157,10 @@ def run_nsga2_optimization(user_idx, candidate_pool, ncf_scores, dopm_recommende
         ncf_scores=ncf_scores,
         dopm_recommender=dopm_recommender,
         serendipity_model=serendipity_model,
+        fairness_model=fairness_model,
         user_history=user_history,
         N=N
     )
-    
-    # Custom repair ensuring duplicate-free chromosomes
-    repair = DuplicateRepair(pool_size)
     
     # 1. Build initial population from P0 variants
     initial_chromosomes = []
@@ -148,9 +185,6 @@ def run_nsga2_optimization(user_idx, candidate_pool, ncf_scores, dopm_recommende
         
     initial_chromosomes = np.array(initial_chromosomes)
     
-    # Repair initial population to enforce unique constraints
-    initial_chromosomes = repair._do(problem, initial_chromosomes)
-    
     # Convert to pymoo Population object
     pop = Population.new("X", initial_chromosomes)
     
@@ -158,8 +192,8 @@ def run_nsga2_optimization(user_idx, candidate_pool, ncf_scores, dopm_recommende
     algorithm = NSGA2(
         pop_size=pop_size,
         sampling=pop,  # Seed with our high-quality PSNR population
-        crossover=SBX(prob=0.9, eta=15, repair=repair),
-        mutation=PM(prob=1.0/N, eta=20, repair=repair),
+        crossover=OrderCrossover(prob=0.9),
+        mutation=SwapMutation(prob=1.0/N),
         eliminate_duplicates=True
     )
     
@@ -174,7 +208,7 @@ def run_nsga2_optimization(user_idx, candidate_pool, ncf_scores, dopm_recommende
     
     # 4. Extract Pareto frontier and select a balanced recommendation list
     pareto_solutions = res.X
-    pareto_fitness = res.F  # Shape: (num_solutions, 3) -> [-Acc, -Nov, -Ser]
+    pareto_fitness = res.F  # Shape: (num_solutions, 3) -> [-DOPM, -Ser, -Fairness]
     
     if pareto_solutions is None or len(pareto_solutions) == 0:
         # Fallback to the first P0 variant
@@ -202,9 +236,9 @@ def run_nsga2_optimization(user_idx, candidate_pool, ncf_scores, dopm_recommende
     pareto_metrics = []
     for f in pareto_fitness:
         pareto_metrics.append({
-            "accuracy": float(-f[0]),
-            "diversity": float(-f[1]),
-            "serendipity": float(-f[2])
+            "dopm": float(-f[0]),
+            "serendipity": float(-f[1]),
+            "fairness": float(-f[2])
         })
         
     return best_movie_list, pareto_metrics

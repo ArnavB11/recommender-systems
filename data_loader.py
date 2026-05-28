@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
@@ -53,7 +54,7 @@ def load_items():
         lambda row: "|".join(genre for genre in GENRE_COLS if row[genre] == 1) or "unknown",
         axis=1,
     )
-    df["age"] = 2025 - df["year"]
+    df["age"] = datetime.now().year - df["year"]
     df["age"] = df["age"].fillna(df["age"].median())
 
     keep = ["item_id", "title", "year", "age", "primary_genre", "genres"] + GENRE_COLS
