@@ -71,6 +71,7 @@ class DOPMRecommender:
         # =====================================================================
         # 2. Global Platform Filtering (IGF)
         # =====================================================================
+        # Pointer to Paper: Implements Equation 1 (IGF = 1 + log(|T| / |T_g|))
         T_g = self.MG.sum(axis=0) 
         safe_T_g = np.where(T_g == 0, 1.0, T_g)
         self.igf = (1.0 + np.log(M / safe_T_g)).astype(np.float32)
@@ -90,6 +91,8 @@ class DOPMRecommender:
         # =====================================================================
         # 4. Precompute final multiplier matrix
         # =====================================================================
+        # Pointer to Paper: Implements the multiplier part of Equation 3 
+        # (Combining the novelty fatigue terms with the IGF terms)
         self.score_matrix = self.genre_novelty * self.igf 
         self.sum_matrix = self.score_matrix.dot(self.MG.T) 
         
@@ -100,6 +103,10 @@ class DOPMRecommender:
         self.dopm_multipliers = np.where(self.G_counts == 0, 1.0, self.dopm_multipliers)
 
     def calculate_novelty(self, u, i):
+        """
+        Pointer to Paper: Implements Equation 2 (Personalized Novelty score)
+        Computes the standalone novelty score without the IGF factor.
+        """
         if u not in self.user2idx or i not in self.movie2idx:
             return 0.0
             
@@ -114,6 +121,10 @@ class DOPMRecommender:
         return float(novelty_sum / g_count)
 
     def calculate_dopm(self, u, i, predicted_rating):
+        """
+        Pointer to Paper: Implements Equation 3 (Final DOPM score)
+        Multiplies the predicted rating (r_hat) with the combined Novelty and IGF scores.
+        """
         if predicted_rating is None:
             return None
             
@@ -132,45 +143,3 @@ class DOPMRecommender:
         """
         return R_hat_matrix * self.dopm_multipliers
 
-# Example Usage
-if __name__ == "__main__":
-    import time
-    
-    # Dummy data setup
-    movie_genres = {
-        'm1': ['Action', 'Sci-Fi'],
-        'm2': ['Romance', 'Comedy'],
-        'm3': ['Documentary'], 
-        'm4': ['Action', 'Comedy']
-    }
-    
-    user_history = {
-        'u1': ['m1', 'm4'],
-        'u2': ['m2']
-    }
-    
-    cf_predictions = {
-        ('u1', 'm2'): 4.5,
-        ('u1', 'm3'): 4.0, 
-    }
-    
-    # Initialize and fit
-    dopm_system = DOPMRecommender(epsilon=0.01)
-    
-    # Time the fast matrix precomputation
-    start_time = time.perf_counter()
-    dopm_system.fit(user_history, movie_genres)
-    end_time = time.perf_counter()
-    
-    print(f"--- Vectorized Precomputation Finished in {(end_time - start_time)*1000:.4f} ms ---")
-    
-    # Dummy R_hat matrix (U x M) representing NCF output
-    # Let's say all ratings are randomly between 3.0 and 5.0
-    R_hat = np.random.uniform(3.0, 5.0, size=(len(dopm_system.users), len(dopm_system.movies)))
-    
-    # Let's explicitly set the ones from our cf_predictions for testing
-    u1_idx, u2_idx = dopm_system.user2idx['u1'], dopm_system.user2idx['u2']
-    m2_idx, m3_idx = dopm_system.movie2idx['m2'], dopm_system.movie2idx['m3']
-    R_hat[u1_idx, m2_idx] = 4.5
-    R_hat[u1_idx, m3_idx] = 4.0
-    
