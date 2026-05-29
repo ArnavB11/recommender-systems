@@ -141,7 +141,7 @@ class RecommendationListProblem(Problem):
 
 def run_nsga2_optimization(user_idx, candidate_pool, ncf_scores, dopm_recommender, 
                            serendipity_model, fairness_model, user_history, initial_population_variants, 
-                           N=10, pop_size=50, n_generations=40):
+                           N=10, pop_size=50, n_generations=500):
     """
     Runs NSGA-II multi-objective optimization to find the Pareto optimal 
     recommendation lists for a single user.
