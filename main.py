@@ -17,7 +17,7 @@ from fairness import FairnessObjective
 N_LIST_SIZE = 10
 NUM_VARIATIONS = 1000
 ROULETTE_POOL_SIZE = 50
-SAMPLE_USERS = [0, 99, 499]
+NUM_SAMPLE_USERS = 3
 
 
 def generate_full_r_hat(model, n_users, n_items):
@@ -48,6 +48,10 @@ def run_pipeline():
     end_time = time.perf_counter()
 
     print(f"Generated R_hat with shape {R_hat.shape} in {(end_time - start_time):.2f} seconds")
+
+    # Randomly pick sample users each run
+    sample_users = np.random.choice(data.n_users, size=min(NUM_SAMPLE_USERS, data.n_users), replace=False).tolist()
+    print(f"Randomly selected sample users: {sample_users}")
 
     print("\n--- Phase 2: Initializing DOPM, BERT Serendipity & Fairness Models ---")
     # Initialize the Stakeholder DOPM Recommender and Fit
@@ -110,7 +114,7 @@ def run_pipeline():
 
         P0[u_idx] = [variant["list"] for variant in accepted_variants]
 
-        if u_idx in SAMPLE_USERS:
+        if u_idx in sample_users:
             sample_results[u_idx] = {
                 "candidate_count": len(candidate_items),
                 "original_ncf_list": original_ncf_list,
@@ -124,7 +128,7 @@ def run_pipeline():
 
     print("\n--- Phase 4: Running Pymoo Multi-Objective NSGA-II Optimization ---")
     
-    for u_idx in SAMPLE_USERS:
+    for u_idx in sample_users:
         if u_idx not in sample_results:
             continue
             
