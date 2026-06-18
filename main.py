@@ -20,7 +20,7 @@ from dataset_linker import DatasetLinker
 from dopm import DOPMRecommender
 from fairness import FairnessObjective
 from fasmoea.fasmoea_runner import run_fasmoea_pipeline
-from genetic_algorithm import run_nsga2_optimization
+from genetic_algorithm import run_nsga2_optimization, run_nsga2_optimization_msrs_ii, run_nsga2_optimization_msrs_iv
 from ncf_inference import get_pure_signal, load_trained_model
 from psnr_filter import filter_by_psnr_sweetspot
 from serendipity import SerendipityModel
@@ -42,11 +42,18 @@ MSRS_ROULETTE_POOL_SIZE = int(os.environ.get("MSRS_ROULETTE_POOL_SIZE", "50"))
 MSRS_POP_SIZE = int(os.environ.get("MSRS_POP_SIZE", "50"))
 MSRS_GENERATIONS = int(os.environ.get("MSRS_GENERATIONS", "40"))
 
+MSRS_II_POP_SIZE = int(os.environ.get("MSRS_II_POP_SIZE", "50"))
+MSRS_II_GENERATIONS = int(os.environ.get("MSRS_II_GENERATIONS", "100"))
+
+MSRS_IV_POP_SIZE = int(os.environ.get("MSRS_IV_POP_SIZE", "50"))
+MSRS_IV_GENERATIONS = int(os.environ.get("MSRS_IV_GENERATIONS", "100"))
+
 
 def prepare_results_dirs():
-    """Clear and recreate the required results subfolders."""
+    """Clear and recreate the required tables and figures subfolders, preserving predictions."""
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    for path in [PREDICTIONS_DIR, TABLES_DIR, FIGURES_DIR]:
+    os.makedirs(PREDICTIONS_DIR, exist_ok=True)
+    for path in [TABLES_DIR, FIGURES_DIR]:
         if os.path.exists(path):
             shutil.rmtree(path)
         os.makedirs(path, exist_ok=True)
@@ -246,6 +253,100 @@ def run_msrs_pipeline(data, R_hat, eval_users, dopm_model, serendipity_model, fa
 
     print(f"\n[MSRS] Complete for {len(eval_users)} users.")
     return msrs_recs
+
+
+def run_msrs_ii_pipeline(data, R_hat, eval_users, dopm_model, serendipity_model, fairness_model):
+    """Run the new MSRS II pipeline (without PSNR filter, with novelty seeding and targeted mutation) for eval users."""
+    print("\n=== [MSRS II] Running NSGA-II optimization per user ===")
+    msrs_ii_recs = {}
+
+    pop_counts = data.item_popularity
+    max_popularity = max(pop_counts.values(), default=1)
+
+    for pos, user_idx in enumerate(eval_users, start=1):
+        print(f"  MSRS II user {user_idx} ({pos}/{len(eval_users)})", end="\r")
+        pure_signal = get_pure_signal(R_hat[user_idx], data.user_history.get(user_idx, set()))
+        candidate_pool = pure_signal["item_indices"][:N_CANDIDATE_POOL]
+
+        if len(candidate_pool) == 0:
+            msrs_ii_recs[int(user_idx)] = []
+            continue
+
+        rec_size = min(N_MAX_REC, len(candidate_pool))
+        if len(candidate_pool) <= rec_size:
+            msrs_ii_recs[int(user_idx)] = [int(item_idx) for item_idx in candidate_pool]
+            continue
+
+        best_list, _ = run_nsga2_optimization_msrs_ii(
+            user_idx=int(user_idx),
+            candidate_pool=candidate_pool,
+            ncf_scores=R_hat[user_idx],
+            dopm_recommender=dopm_model,
+            serendipity_model=serendipity_model,
+            fairness_model=fairness_model,
+            user_history=list(data.user_history.get(user_idx, set())),
+            item_popularity=pop_counts,
+            max_popularity=max_popularity,
+            N=rec_size,
+            pop_size=MSRS_II_POP_SIZE,
+            n_generations=MSRS_II_GENERATIONS,
+        )
+        msrs_ii_recs[int(user_idx)] = ensure_recommendation_length(
+            best_list,
+            candidate_pool,
+            N_MAX_REC,
+        )
+
+    print(f"\n[MSRS II] Complete for {len(eval_users)} users.")
+    return msrs_ii_recs
+
+
+def run_msrs_iv_pipeline(data, R_hat, eval_users, dopm_model, serendipity_model, fairness_model):
+    """Run the new MSRS IV pipeline (without PSNR filter, with novelty seeding and relevance-constrained targeted mutation) for eval users."""
+    print("\n=== [MSRS IV] Running NSGA-II optimization per user ===")
+    msrs_iv_recs = {}
+
+    pop_counts = data.item_popularity
+    max_popularity = max(pop_counts.values(), default=1)
+
+    for pos, user_idx in enumerate(eval_users, start=1):
+        print(f"  MSRS IV user {user_idx} ({pos}/{len(eval_users)})", end="\r")
+        pure_signal = get_pure_signal(R_hat[user_idx], data.user_history.get(user_idx, set()))
+        candidate_pool = pure_signal["item_indices"][:N_CANDIDATE_POOL]
+
+        if len(candidate_pool) == 0:
+            msrs_iv_recs[int(user_idx)] = []
+            continue
+
+        rec_size = min(N_MAX_REC, len(candidate_pool))
+        if len(candidate_pool) <= rec_size:
+            msrs_iv_recs[int(user_idx)] = [int(item_idx) for item_idx in candidate_pool]
+            continue
+
+        best_list, _ = run_nsga2_optimization_msrs_iv(
+            user_idx=int(user_idx),
+            candidate_pool=candidate_pool,
+            ncf_scores=R_hat[user_idx],
+            dopm_recommender=dopm_model,
+            serendipity_model=serendipity_model,
+            fairness_model=fairness_model,
+            user_history=list(data.user_history.get(user_idx, set())),
+            item_popularity=pop_counts,
+            max_popularity=max_popularity,
+            N=rec_size,
+            pop_size=MSRS_IV_POP_SIZE,
+            n_generations=MSRS_IV_GENERATIONS,
+        )
+        msrs_iv_recs[int(user_idx)] = ensure_recommendation_length(
+            best_list,
+            candidate_pool,
+            N_MAX_REC,
+        )
+
+    print(f"\n[MSRS IV] Complete for {len(eval_users)} users.")
+    return msrs_iv_recs
+
+
 
 
 def precision_at_k(rec_list, ground_truth, k):
@@ -455,7 +556,7 @@ def evaluate_model(recommendations, model_name, data, R_hat, ground_truth, eval_
 
 def save_all_tables(results, tables_dir, k_values):
     rows = []
-    for model in ["FAS-MOEA", "MSRS"]:
+    for model in ["FAS-MOEA", "MSRS", "MSRS II", "MSRS IV"]:#
         for k in k_values:
             row = {"Model": model, "K": k}
             row.update(results[model][k])
@@ -485,10 +586,10 @@ def save_all_tables(results, tables_dir, k_values):
 def plot_metric_topn(df_all, metric_name, ylabel, title, filename, figs_dir):
     plt.style.use("seaborn-v0_8-whitegrid")
     fig, ax = plt.subplots(figsize=(8, 5))
-    colors = {"FAS-MOEA": "#2196F3", "MSRS": "#FF9800"}
-    styles = {"FAS-MOEA": "-", "MSRS": "--"}
-    markers = {"FAS-MOEA": "o", "MSRS": "s"}
-    for model in ["FAS-MOEA", "MSRS"]:
+    colors = {"FAS-MOEA": "#2196F3", "MSRS": "#FF9800", "MSRS II": "#4CAF50", "MSRS IV": "#9C27B0"}
+    styles = {"FAS-MOEA": "-", "MSRS": "--", "MSRS II": "-.", "MSRS IV": ":"}
+    markers = {"FAS-MOEA": "o", "MSRS": "s", "MSRS II": "^", "MSRS IV": "D"}
+    for model in ["FAS-MOEA", "MSRS", "MSRS II", "MSRS IV"]:
         sub = df_all[df_all["Model"] == model].sort_values("K")
         ax.plot(
             sub["K"],
@@ -556,13 +657,13 @@ def plot_radar_summary(df_all, figs_dir):
 
     plt.style.use("seaborn-v0_8-whitegrid")
     fig, ax = plt.subplots(figsize=(9, 9), subplot_kw={"projection": "polar"})
-    colors = {"FAS-MOEA": "#2196F3", "MSRS": "#FF9800"}
+    colors = {"FAS-MOEA": "#2196F3", "MSRS": "#FF9800", "MSRS II": "#4CAF50", "MSRS IV": "#9C27B0"}
 
-    for model in ["FAS-MOEA", "MSRS"]:
+    for model in ["FAS-MOEA", "MSRS", "MSRS II", "MSRS IV"]:
         values = [normalized[metric].get(model, 0.0) for metric in metrics]
         values += values[:1]
-        ax.plot(angles, values, color=colors[model], linewidth=2, label=model)
-        ax.fill(angles, values, color=colors[model], alpha=0.2)
+        ax.plot(angles, values, color=colors[model], linewidth=2.5, label=model)
+        ax.fill(angles, values, color=colors[model], alpha=0.05)
 
     ax.set_xticks(angles[:-1])
     ax.set_xticklabels(labels, fontsize=10)
@@ -622,19 +723,23 @@ def plot_grouped_bar_k10(df_all, figs_dir):
         ("System Fairness", ["FAS_Fairness@K", "GenreEntropy@K", "ProducerFairness@K"]),
     ]
     df_k10 = df_all[df_all["K"] == 10].set_index("Model")
-    colors = {"FAS-MOEA": "#2196F3", "MSRS": "#FF9800"}
+    colors = {"FAS-MOEA": "#2196F3", "MSRS": "#FF9800", "MSRS II": "#4CAF50", "MSRS IV": "#9C27B0"}
 
     plt.style.use("seaborn-v0_8-whitegrid")
-    fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5.5))
 
     for ax, (title, metrics) in zip(axes, groups):
         x = np.arange(len(metrics))
-        width = 0.36
+        width = 0.18
         fas_vals = [float(df_k10.loc["FAS-MOEA", metric]) for metric in metrics]
         msrs_vals = [float(df_k10.loc["MSRS", metric]) for metric in metrics]
+        msrs_ii_vals = [float(df_k10.loc["MSRS II", metric]) for metric in metrics]
+        msrs_iv_vals = [float(df_k10.loc["MSRS IV", metric]) for metric in metrics]
 
-        ax.bar(x - width / 2, fas_vals, width, label="FAS-MOEA", color=colors["FAS-MOEA"])
-        ax.bar(x + width / 2, msrs_vals, width, label="MSRS", color=colors["MSRS"])
+        ax.bar(x - 1.5 * width, fas_vals, width, label="FAS-MOEA", color=colors["FAS-MOEA"])
+        ax.bar(x - 0.5 * width, msrs_vals, width, label="MSRS", color=colors["MSRS"])
+        ax.bar(x + 0.5 * width, msrs_ii_vals, width, label="MSRS II", color=colors["MSRS II"])
+        ax.bar(x + 1.5 * width, msrs_iv_vals, width, label="MSRS IV", color=colors["MSRS IV"])
         ax.set_title(title, fontsize=11, fontweight="bold")
         ax.set_xticks(x)
         ax.set_xticklabels([metric.replace("@K", "") for metric in metrics], rotation=35, ha="right")
@@ -689,14 +794,14 @@ def print_k10_summary(results):
         "ProducerFairness@K",
     ]
 
-    print(f"\n{'Metric':<25} {'FAS-MOEA':>10} {'MSRS':>10} {'Delta':>10}")
-    print("-" * 57)
+    print(f"\n{'Metric':<25} {'FAS-MOEA':>10} {'MSRS':>10} {'MSRS II':>10} {'MSRS IV':>10}")
+    print("-" * 70)
     for metric in key_metrics:
         v_fas = results["FAS-MOEA"][10].get(metric, 0.0)
         v_msrs = results["MSRS"][10].get(metric, 0.0)
-        delta = v_fas - v_msrs
-        sign = "+" if delta >= 0 else ""
-        print(f"{metric:<25} {v_fas:>10.4f} {v_msrs:>10.4f} {sign}{delta:>9.4f}")
+        v_msrs2 = results["MSRS II"][10].get(metric, 0.0)
+        v_msrs4 = results["MSRS IV"][10].get(metric, 0.0)
+        print(f"{metric:<25} {v_fas:>10.4f} {v_msrs:>10.4f} {v_msrs2:>10.4f} {v_msrs4:>10.4f}")
 
 
 def main():
@@ -721,7 +826,44 @@ def main():
 
     dopm_model, serendipity_model, fairness_model = initialize_shared_models(data)
 
-    msrs_recs = run_msrs_pipeline(
+    # 1. Load or run MSRS
+    msrs_pred_path = os.path.join(PREDICTIONS_DIR, "msrs_recommendations.json")
+    if os.path.exists(msrs_pred_path):
+        print(f"\n[MSRS] Loading existing predictions from {msrs_pred_path}")
+        with open(msrs_pred_path, "r", encoding="utf-8") as f:
+            msrs_recs = json.load(f)
+            msrs_recs = {int(k): v for k, v in msrs_recs.items()}
+    else:
+        msrs_recs = run_msrs_pipeline(
+            data=data,
+            R_hat=R_hat,
+            eval_users=eval_users,
+            dopm_model=dopm_model,
+            serendipity_model=serendipity_model,
+            fairness_model=fairness_model,
+        )
+        save_json(msrs_pred_path, msrs_recs)
+
+    # 2. Load or run MSRS II
+    msrs_ii_pred_path = os.path.join(PREDICTIONS_DIR, "msrs_ii_recommendations.json")
+    if os.path.exists(msrs_ii_pred_path):
+        print(f"\n[MSRS II] Loading existing predictions from {msrs_ii_pred_path}")
+        with open(msrs_ii_pred_path, "r", encoding="utf-8") as f:
+            msrs_ii_recs = json.load(f)
+            msrs_ii_recs = {int(k): v for k, v in msrs_ii_recs.items()}
+    else:
+        msrs_ii_recs = run_msrs_ii_pipeline(
+            data=data,
+            R_hat=R_hat,
+            eval_users=eval_users,
+            dopm_model=dopm_model,
+            serendipity_model=serendipity_model,
+            fairness_model=fairness_model,
+        )
+        save_json(msrs_ii_pred_path, msrs_ii_recs)
+
+    # 3. Run MSRS IV
+    msrs_iv_recs = run_msrs_iv_pipeline(
         data=data,
         R_hat=R_hat,
         eval_users=eval_users,
@@ -729,11 +871,25 @@ def main():
         serendipity_model=serendipity_model,
         fairness_model=fairness_model,
     )
-    save_json(os.path.join(PREDICTIONS_DIR, "msrs_recommendations.json"), msrs_recs)
+    save_json(os.path.join(PREDICTIONS_DIR, "msrs_iv_recommendations.json"), msrs_iv_recs)
 
-    fasmoea_recs, fasmoea_pareto, fasmoea_objectives = run_fasmoea_pipeline(data, R_hat, eval_users)
-    save_json(os.path.join(PREDICTIONS_DIR, "fasmoea_recommendations.json"), fasmoea_recs)
-    save_json(os.path.join(PREDICTIONS_DIR, "fasmoea_pareto.json"), fasmoea_pareto)
+    # 4. Load or run FAS-MOEA
+    fas_pred_path = os.path.join(PREDICTIONS_DIR, "fasmoea_recommendations.json")
+    fas_pareto_path = os.path.join(PREDICTIONS_DIR, "fasmoea_pareto.json")
+    if os.path.exists(fas_pred_path) and os.path.exists(fas_pareto_path):
+        print(f"\n[FAS-MOEA] Loading existing predictions from {fas_pred_path}")
+        with open(fas_pred_path, "r", encoding="utf-8") as f:
+            fasmoea_recs = json.load(f)
+            fasmoea_recs = {int(k): v for k, v in fasmoea_recs.items()}
+        with open(fas_pareto_path, "r", encoding="utf-8") as f:
+            fasmoea_pareto = json.load(f)
+            fasmoea_pareto = {int(k): v for k, v in fasmoea_pareto.items()}
+        from fasmoea.fasmoea_model import FASMOEAObjectives
+        fasmoea_objectives = FASMOEAObjectives(data, R_hat).fit()
+    else:
+        fasmoea_recs, fasmoea_pareto, fasmoea_objectives = run_fasmoea_pipeline(data, R_hat, eval_users)
+        save_json(fas_pred_path, fasmoea_recs)
+        save_json(fas_pareto_path, fasmoea_pareto)
 
     results = {
         "FAS-MOEA": evaluate_model(
@@ -750,6 +906,28 @@ def main():
         "MSRS": evaluate_model(
             msrs_recs,
             "MSRS",
+            data,
+            R_hat,
+            ground_truth,
+            eval_users,
+            dopm_model,
+            fasmoea_objectives,
+            fairness_model,
+        ),
+        "MSRS II": evaluate_model(
+            msrs_ii_recs,
+            "MSRS II",
+            data,
+            R_hat,
+            ground_truth,
+            eval_users,
+            dopm_model,
+            fasmoea_objectives,
+            fairness_model,
+        ),
+        "MSRS IV": evaluate_model(
+            msrs_iv_recs,
+            "MSRS IV",
             data,
             R_hat,
             ground_truth,
