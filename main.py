@@ -218,8 +218,8 @@ def run_msrs_pipeline(data, R_hat, eval_users, dopm_model, serendipity_model, fa
             original_list=original_ncf_list,
             variant_lists=roulette_lists.get(int(user_idx), []),
             movie_scores_dict=movie_scores_dict,
-            lower_percentile=25,
-            upper_percentile=75,
+            lower_percentile=10,
+            upper_percentile=90,
             max_val=1.0,
         )
 
