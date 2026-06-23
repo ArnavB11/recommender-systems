@@ -22,7 +22,7 @@ def calculate_list_psnr(original_scores, variant_scores, max_val=1.0):
     psnr = 10 * math.log10((max_val ** 2) / mse)
     return psnr
 
-def calculate_dynamic_thresholds(psnr_values, lower_percentile=25, upper_percentile=75):
+def calculate_dynamic_thresholds(psnr_values, lower_percentile=10, upper_percentile=90):
     """
     Dynamically calculates the lower and upper PSNR thresholds based on the 
     statistical distribution of the generated lists for a specific user.
@@ -40,7 +40,7 @@ def calculate_dynamic_thresholds(psnr_values, lower_percentile=25, upper_percent
     return lower_thresh, upper_thresh
 
 def filter_by_psnr_sweetspot(original_list, variant_lists, movie_scores_dict, 
-                             lower_percentile=25, upper_percentile=75, max_val=1.0):
+                             lower_percentile=10, upper_percentile=90, max_val=1.0):
     """
     Dynamically filters variant lists for a user by calculating the mathematical sweet spot.
     
@@ -118,13 +118,13 @@ if __name__ == "__main__":
         original_list, 
         variant_lists, 
         movie_scores, 
-        lower_percentile=25, 
-        upper_percentile=75
+        lower_percentile=10, 
+        upper_percentile=90
     )
     
     print(f"Mathematically Calculated User Thresholds:")
-    print(f"Lower Bound (25th Percentile): {low:.2f}")
-    print(f"Upper Bound (75th Percentile): {high:.2f}")
+    print(f"Lower Bound (10th Percentile): {low:.2f}")
+    print(f"Upper Bound (90th Percentile): {high:.2f}")
     
     print(f"\nFound {len(accepted)} variant(s) inside this sweet spot!")
     for item in accepted:
