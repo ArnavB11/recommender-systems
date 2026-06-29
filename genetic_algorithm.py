@@ -74,140 +74,6 @@ class SwapMutation(Mutation):
         return Y
 
 
-class MSRSIITargetedMutation(Mutation):
-    """
-    Targeted mutation for permutation chromosomes in MSRS II.
-    Replaces the item in the list with the lowest predicted NCF score
-    with the item outside the list that has the highest popularity-novelty score.
-    """
-    def __init__(self, prob=0.1, ncf_scores=None, novelty_scores=None, pool_size=None):
-        super().__init__(prob=1.0)
-        self.prob_ind = prob
-        self.ncf_scores = ncf_scores
-        self.novelty_scores = novelty_scores
-        self.pool_size = pool_size
-
-    def _do(self, problem, X, *args, random_state=None, **kwargs):
-        if random_state is None:
-            rng = np.random.default_rng()
-        elif hasattr(random_state, "integers"):
-            rng = np.random.default_rng(int(random_state.integers(0, 2**31 - 1)))
-        else:
-            rng = np.random.default_rng(int(random_state.randint(0, 2**31 - 1)))
-
-        Y = X.copy().astype(int)
-        pool_size = self.pool_size
-        if pool_size is None:
-            if self.ncf_scores is not None:
-                pool_size = len(self.ncf_scores)
-            elif self.novelty_scores is not None:
-                pool_size = len(self.novelty_scores)
-            else:
-                pool_size = problem.xu + 1
-
-        for i in range(len(Y)):
-            if rng.random() > self.prob_ind:
-                continue
-            chromosome = Y[i]
-            if len(chromosome) == 0:
-                continue
-
-            if self.ncf_scores is not None:
-                worst_pos = int(np.argmin(self.ncf_scores[chromosome]))
-            else:
-                worst_pos = int(rng.integers(0, len(chromosome)))
-
-            in_list = set(chromosome.tolist())
-            candidates_outside = [idx for idx in range(pool_size) if idx not in in_list]
-            if not candidates_outside:
-                continue
-
-            if self.novelty_scores is not None:
-                novelty_values = self.novelty_scores[candidates_outside]
-                replacement = candidates_outside[int(np.argmax(novelty_values))]
-            else:
-                replacement = int(rng.choice(candidates_outside))
-            Y[i, worst_pos] = replacement
-        return Y
-
-
-class MSRSIVTargetedMutation(Mutation):
-    """
-    Targeted mutation for permutation chromosomes in MSRS IV.
-    Replaces the item in the list with the lowest predicted NCF score
-    with the item outside the list that has the highest popularity-novelty score,
-    constrained to items that have an NCF score greater than or equal to the median
-    NCF score of the candidate pool.
-    """
-    def __init__(self, prob=0.1, ncf_scores=None, novelty_scores=None, pool_size=None):
-        super().__init__(prob=1.0)
-        self.prob_ind = prob
-        self.ncf_scores = ncf_scores
-        self.novelty_scores = novelty_scores
-        self.pool_size = pool_size
-        
-        # Calculate the dynamic threshold as the median NCF score of the pool
-        if self.ncf_scores is not None:
-            self.relevance_threshold = np.median(self.ncf_scores)
-        else:
-            self.relevance_threshold = 0.0
-
-    def _do(self, problem, X, *args, random_state=None, **kwargs):
-        if random_state is None:
-            rng = np.random.default_rng()
-        elif hasattr(random_state, "integers"):
-            rng = np.random.default_rng(int(random_state.integers(0, 2**31 - 1)))
-        else:
-            rng = np.random.default_rng(int(random_state.randint(0, 2**31 - 1)))
-
-        Y = X.copy().astype(int)
-        pool_size = self.pool_size
-        if pool_size is None:
-            if self.ncf_scores is not None:
-                pool_size = len(self.ncf_scores)
-            elif self.novelty_scores is not None:
-                pool_size = len(self.novelty_scores)
-            else:
-                pool_size = problem.xu + 1
-
-        for i in range(len(Y)):
-            if rng.random() > self.prob_ind:
-                continue
-            chromosome = Y[i]
-            if len(chromosome) == 0:
-                continue
-
-            if self.ncf_scores is not None:
-                worst_pos = int(np.argmin(self.ncf_scores[chromosome]))
-            else:
-                worst_pos = int(rng.integers(0, len(chromosome)))
-
-            in_list = set(chromosome.tolist())
-            candidates_outside = [idx for idx in range(pool_size) if idx not in in_list]
-            if not candidates_outside:
-                continue
-
-            if self.novelty_scores is not None and self.ncf_scores is not None:
-                ncf_outside = self.ncf_scores[candidates_outside]
-                # Filter candidates above the relevance threshold (median of candidate pool NCF scores)
-                valid_indices = np.where(ncf_outside >= self.relevance_threshold)[0]
-                
-                if len(valid_indices) > 0:
-                    valid_candidates = [candidates_outside[idx] for idx in valid_indices]
-                    novelty_values = self.novelty_scores[valid_candidates]
-                    replacement = valid_candidates[int(np.argmax(novelty_values))]
-                else:
-                    # Fallback to absolute best novelty if none meet the threshold
-                    novelty_values = self.novelty_scores[candidates_outside]
-                    replacement = candidates_outside[int(np.argmax(novelty_values))]
-            elif self.novelty_scores is not None:
-                novelty_values = self.novelty_scores[candidates_outside]
-                replacement = candidates_outside[int(np.argmax(novelty_values))]
-            else:
-                replacement = int(rng.choice(candidates_outside))
-            Y[i, worst_pos] = replacement
-        return Y
-
 
 
 class RecommendationListProblem(Problem):
@@ -376,119 +242,50 @@ def run_nsga2_optimization(user_idx, candidate_pool, ncf_scores, dopm_recommende
             "serendipity": float(-f[1]),
             "fairness": float(-f[2])
         })
-        
     return best_movie_list, pareto_metrics
 
 
-def run_nsga2_optimization_msrs_ii(user_idx, candidate_pool, ncf_scores, dopm_recommender, 
-                                  serendipity_model, fairness_model, user_history, item_popularity, max_popularity,
-                                  N=10, pop_size=50, n_generations=100, seed=42):
+class MSRSIVTargetedMutation(Mutation):
     """
-    Runs NSGA-II multi-objective optimization to find the Pareto optimal 
-    recommendation lists for a single user (MSRS II version).
+    Targeted mutation for permutation chromosomes in MSRS IV.
+    Replaces the item with the lowest NCF score with the highest-novelty
+    item outside the list that satisfies a minimum relevance (NCF score) threshold.
     """
-    pool_size = len(candidate_pool)
-    if pool_size < N:
-        return candidate_pool, None
-        
-    problem = RecommendationListProblem(
-        user_idx=user_idx,
-        candidate_pool=candidate_pool,
-        ncf_scores=ncf_scores,
-        dopm_recommender=dopm_recommender,
-        serendipity_model=serendipity_model,
-        fairness_model=fairness_model,
-        user_history=user_history,
-        N=N
-    )
-    
-    # 1. Compute novelty scores for candidate pool
-    novelty_scores_pool = np.zeros(pool_size, dtype=np.float32)
-    max_pop = max_popularity if max_popularity > 1 else 1
-    for idx, item in enumerate(candidate_pool):
-        pop = item_popularity.get(item, 0)
-        novelty_scores_pool[idx] = float(1.0 - (np.log(pop + 1) / np.log(max_pop + 1)))
-        
-    ncf_scores_pool = np.asarray(
-        [float(ncf_scores[item]) if item < len(ncf_scores) else 0.0 for item in candidate_pool],
-        dtype=np.float32
-    )
-    
-    # 2. Build initial population from seeds
-    initial_chromosomes = []
-    
-    # Seed 1: Top NCF-based recommendation list (Anchor for accuracy)
-    top_ncf_indices = np.argsort(-ncf_scores_pool)[:N]
-    initial_chromosomes.append(top_ncf_indices.tolist())
-    
-    # Seed 2: Top popularity-novelty recommendation list (Anchor for long-tail)
-    top_novelty_indices = np.argsort(-novelty_scores_pool)[:N]
-    if len(set(top_novelty_indices.tolist())) == N:
-        initial_chromosomes.append(top_novelty_indices.tolist())
-        
-    # Seed 3: Fill remaining population randomly
-    rng = np.random.default_rng(seed + int(user_idx))
-    while len(initial_chromosomes) < pop_size:
-        initial_chromosomes.append(list(rng.choice(pool_size, size=N, replace=False)))
-        
-    initial_chromosomes = np.array(initial_chromosomes, dtype=int)
-    
-    # Convert to pymoo Population object
-    pop = Population.new("X", initial_chromosomes)
-    
-    # 3. Setup NSGA2 Algorithm
-    algorithm = NSGA2(
-        pop_size=pop_size,
-        sampling=pop,
-        crossover=OrderCrossover(prob=0.9),
-        mutation=MSRSIITargetedMutation(
-            prob=0.1,
-            ncf_scores=ncf_scores_pool,
-            novelty_scores=novelty_scores_pool,
-            pool_size=pool_size
-        ),
-        eliminate_duplicates=True
-    )
-    
-    # 4. Optimize
-    res = minimize(
-        problem,
-        algorithm,
-        termination=('n_gen', n_generations),
-        seed=seed + int(user_idx),
-        verbose=False
-    )
-    
-    # 5. Extract Pareto frontier and select a balanced recommendation list
-    pareto_solutions = res.X
-    pareto_fitness = res.F
-    
-    if pareto_solutions is None or len(pareto_solutions) == 0:
-        return [candidate_pool[idx] for idx in top_ncf_indices], None
-        
-    # Choose compromise solution closest to the ideal point
-    pareto_F = np.atleast_2d(pareto_fitness)
-    pareto_X = np.atleast_2d(pareto_solutions)
-    
-    ideal = np.min(pareto_F, axis=0)
-    nadir = np.max(pareto_F, axis=0)
-    spread = np.where(nadir - ideal == 0, 1.0, nadir - ideal)
-    normalized = (pareto_F - ideal) / spread
-    best_idx = int(np.argmin(np.linalg.norm(normalized, axis=1)))
-    
-    best_chromosome = pareto_X[best_idx].astype(int)
-    best_movie_list = [candidate_pool[idx] for idx in best_chromosome]
-    
-    # Return best list and full Pareto fitness logs for analysis
-    pareto_metrics = []
-    for f in pareto_F:
-        pareto_metrics.append({
-            "dopm": float(-f[0]),
-            "serendipity": float(-f[1]),
-            "fairness": float(-f[2])
-        })
-        
-    return best_movie_list, pareto_metrics
+    def __init__(self, prob, ncf_scores, novelty_scores, pool_size, relevance_threshold=None):
+        super().__init__(prob=1.0)
+        self.prob_gene = prob
+        self.ncf_scores = ncf_scores
+        self.novelty_scores = novelty_scores
+        self.pool_size = pool_size
+        self.relevance_threshold = relevance_threshold if relevance_threshold is not None else np.mean(ncf_scores)
+
+    def _do(self, problem, X, *args, random_state=None, **kwargs):
+        Y = X.copy().astype(int)
+        n_individuals, n_var = Y.shape
+
+        for i in range(n_individuals):
+            if random_state.random() < self.prob_gene:
+                rec_list = Y[i].astype(int)
+                rec_ncf = self.ncf_scores[rec_list]
+                lowest_idx_in_rec = np.argmin(rec_ncf)
+
+                # Identify items outside the list
+                outside_mask = np.ones(self.pool_size, dtype=bool)
+                outside_mask[rec_list] = False
+                outside_indices = np.where(outside_mask)[0]
+
+                # Filter outside items by the relevance constraint
+                relevant_outside = outside_indices[self.ncf_scores[outside_indices] >= self.relevance_threshold]
+
+                if len(relevant_outside) == 0:
+                    relevant_outside = outside_indices
+
+                if len(relevant_outside) > 0:
+                    outside_novelties = self.novelty_scores[relevant_outside]
+                    highest_novelty_idx_outside = relevant_outside[np.argmax(outside_novelties)]
+                    Y[i, lowest_idx_in_rec] = highest_novelty_idx_outside
+
+        return Y
 
 
 def run_nsga2_optimization_msrs_iv(user_idx, candidate_pool, ncf_scores, dopm_recommender, 
@@ -600,5 +397,6 @@ def run_nsga2_optimization_msrs_iv(user_idx, candidate_pool, ncf_scores, dopm_re
         })
         
     return best_movie_list, pareto_metrics
+
 
 
